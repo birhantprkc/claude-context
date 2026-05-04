@@ -27,6 +27,7 @@ const DEFAULT_SUPPORTED_EXTENSIONS = [
     // Programming languages
     '.ts', '.tsx', '.js', '.jsx', '.py', '.java', '.cpp', '.c', '.h', '.hpp',
     '.cs', '.go', '.rs', '.php', '.rb', '.swift', '.kt', '.scala', '.m', '.mm',
+    '.dart', '.sol',
     // Text and markup files
     '.md', '.markdown', '.ipynb',
     // '.txt',  '.json', '.yaml', '.yml', '.xml', '.html', '.htm',
@@ -94,14 +95,20 @@ export interface ContextConfig {
     ignorePatterns?: string[];
     customExtensions?: string[]; // New: custom extensions from MCP
     customIgnorePatterns?: string[]; // New: custom ignore patterns from MCP
+    collectionNameOverride?: string; // Optional: custom collection name suffix
 }
 
 export class Context {
+    private static readonly MAX_COLLECTION_NAME_LENGTH = 255;
+
     private embedding: Embedding;
     private vectorDatabase: VectorDatabase;
     private codeSplitter: Splitter;
     private supportedExtensions: string[];
+    private baseIgnorePatterns: string[];
     private ignorePatterns: string[];
+    private collectionNameOverride?: string;
+    private warnedOverrideSanitization = new Set<string>();
     private synchronizers = new Map<string, FileSynchronizer>();
 
     constructor(config: ContextConfig = {}) {
@@ -135,15 +142,16 @@ export class Context {
         // Load custom ignore patterns from environment variables  
         const envCustomIgnorePatterns = this.getCustomIgnorePatternsFromEnv();
 
-        // Start with default ignore patterns
+        // Start with default ignore patterns and persistent config/env patterns.
         const allIgnorePatterns = [
             ...DEFAULT_IGNORE_PATTERNS,
             ...(config.ignorePatterns || []),
             ...(config.customIgnorePatterns || []),
             ...envCustomIgnorePatterns
         ];
-        // Remove duplicates
-        this.ignorePatterns = [...new Set(allIgnorePatterns)];
+        this.baseIgnorePatterns = this.dedupePatterns(allIgnorePatterns);
+        this.ignorePatterns = [...this.baseIgnorePatterns];
+        this.collectionNameOverride = config.collectionNameOverride;
 
         console.log(`[Context] 🔧 Initialized with ${this.supportedExtensions.length} supported extensions and ${this.ignorePatterns.length} ignore patterns`);
         if (envCustomExtensions.length > 0) {
@@ -183,6 +191,15 @@ export class Context {
     }
 
     /**
+     * Get supported extensions for the current operation without mutating
+     * the Context's persistent extension list.
+     */
+    getEffectiveSupportedExtensions(additionalExtensions: string[] = []): string[] {
+        const normalizedExtensions = this.normalizeExtensions(additionalExtensions);
+        return [...new Set([...this.supportedExtensions, ...normalizedExtensions])];
+    }
+
+    /**
      * Get ignore patterns
      */
     getIgnorePatterns(): string[] {
@@ -207,7 +224,15 @@ export class Context {
      * Public wrapper for loadIgnorePatterns private method
      */
     async getLoadedIgnorePatterns(codebasePath: string): Promise<void> {
-        return this.loadIgnorePatterns(codebasePath);
+        await this.loadIgnorePatterns(codebasePath);
+    }
+
+    /**
+     * Get the effective ignore patterns for a codebase without relying on
+     * codebase-specific patterns already stored on this Context instance.
+     */
+    async getEffectiveIgnorePatterns(codebasePath: string, additionalIgnorePatterns: string[] = []): Promise<string[]> {
+        return this.loadIgnorePatterns(codebasePath, additionalIgnorePatterns);
     }
 
     /**
@@ -233,10 +258,58 @@ export class Context {
      */
     public getCollectionName(codebasePath: string): string {
         const isHybrid = this.getIsHybrid();
-        const normalizedPath = path.resolve(codebasePath);
-        const hash = crypto.createHash('md5').update(normalizedPath).digest('hex');
         const prefix = isHybrid === true ? 'hybrid_code_chunks' : 'code_chunks';
-        return `${prefix}_${hash.substring(0, 8)}`;
+        const normalizedPath = path.resolve(codebasePath);
+        const pathHash = crypto.createHash('md5').update(normalizedPath).digest('hex').substring(0, 8);
+
+        // Overrides always keep the per-codebase `_<pathHash>` suffix so that multiple
+        // codebases indexed by the same MCP server can't collapse into one collection.
+        const configOverride = this.getValidOverrideValue(this.collectionNameOverride);
+        if (configOverride) {
+            const suffix = this.sanitizeCollectionNameSuffix(configOverride, prefix, pathHash, 'Context config');
+            return `${prefix}_${suffix}`;
+        }
+
+        const envOverride = this.getValidOverrideValue(envManager.get('CODE_CHUNKS_COLLECTION_NAME_OVERRIDE'));
+        if (envOverride) {
+            const suffix = this.sanitizeCollectionNameSuffix(envOverride, prefix, pathHash, 'CODE_CHUNKS_COLLECTION_NAME_OVERRIDE');
+            return `${prefix}_${suffix}`;
+        }
+
+        return `${prefix}_${pathHash}`;
+    }
+
+    private getValidOverrideValue(value?: string): string | undefined {
+        if (!value) {
+            return undefined;
+        }
+        const trimmed = value.trim();
+        return trimmed.length > 0 ? trimmed : undefined;
+    }
+
+    private sanitizeCollectionNameSuffix(value: string, prefix: string, pathHash: string, source: string): string {
+        const hashSuffix = `_${pathHash}`;
+        // Leave room for both the prefix and the trailing `_<pathHash>` disambiguator.
+        const maxReadableLength = Context.MAX_COLLECTION_NAME_LENGTH - `${prefix}_`.length - hashSuffix.length;
+        const normalized = value.trim();
+        let sanitized = normalized.replace(/[^A-Za-z0-9_]/g, '_');
+        sanitized = sanitized.slice(0, Math.max(0, maxReadableLength));
+
+        if (sanitized.length === 0) {
+            sanitized = 'custom';
+        }
+
+        const full = `${sanitized}${hashSuffix}`;
+
+        if (sanitized !== normalized) {
+            const warningKey = `${source}:${normalized}:${sanitized}`;
+            if (!this.warnedOverrideSanitization.has(warningKey)) {
+                console.warn(`[Context] ⚠️ Sanitized collection name override from "${normalized}" to "${sanitized}" (${source}); final suffix "${full}"`);
+                this.warnedOverrideSanitization.add(warningKey);
+            }
+        }
+
+        return full;
     }
 
     /**
@@ -244,19 +317,27 @@ export class Context {
      * @param codebasePath Codebase root path
      * @param progressCallback Optional progress callback function
      * @param forceReindex Whether to recreate the collection even if it exists
+     * @param additionalIgnorePatterns Request-scoped ignore patterns
+     * @param additionalSupportedExtensions Request-scoped file extensions
+     * @param requestSplitter Request-scoped splitter for this indexing run
      * @returns Indexing statistics
      */
     async indexCodebase(
         codebasePath: string,
         progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void,
-        forceReindex: boolean = false
+        forceReindex: boolean = false,
+        additionalIgnorePatterns: string[] = [],
+        additionalSupportedExtensions: string[] = [],
+        requestSplitter?: Splitter
     ): Promise<{ indexedFiles: number; totalChunks: number; status: 'completed' | 'limit_reached' }> {
         const isHybrid = this.getIsHybrid();
         const searchType = isHybrid === true ? 'hybrid search' : 'semantic search';
         console.log(`[Context] 🚀 Starting to index codebase with ${searchType}: ${codebasePath}`);
+        const splitter = requestSplitter || this.codeSplitter;
 
-        // 1. Load ignore patterns from various ignore files
-        await this.loadIgnorePatterns(codebasePath);
+        // 1. Compute ignore patterns for this codebase/request without
+        // retaining file-based patterns from previous codebases.
+        const ignorePatterns = await this.loadIgnorePatterns(codebasePath, additionalIgnorePatterns);
 
         // 2. Check and prepare vector collection
         progressCallback?.({ phase: 'Preparing collection...', current: 0, total: 100, percentage: 0 });
@@ -265,7 +346,8 @@ export class Context {
 
         // 3. Recursively traverse codebase to get all supported files
         progressCallback?.({ phase: 'Scanning files...', current: 5, total: 100, percentage: 5 });
-        const codeFiles = await this.getCodeFiles(codebasePath);
+        const supportedExtensions = this.getEffectiveSupportedExtensions(additionalSupportedExtensions);
+        const codeFiles = await this.getCodeFiles(codebasePath, ignorePatterns, supportedExtensions);
         console.log(`[Context] 📁 Found ${codeFiles.length} code files`);
 
         if (codeFiles.length === 0) {
@@ -293,7 +375,8 @@ export class Context {
                     total: totalFiles,
                     percentage: Math.round(progressPercentage)
                 });
-            }
+            },
+            splitter
         );
 
         console.log(`[Context] ✅ Codebase indexing completed! Processed ${result.processedFiles} files in total, generated ${result.totalChunks} code chunks`);
@@ -314,17 +397,23 @@ export class Context {
 
     async reindexByChange(
         codebasePath: string,
-        progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void
+        progressCallback?: (progress: { phase: string; current: number; total: number; percentage: number }) => void,
+        additionalIgnorePatterns: string[] = [],
+        additionalSupportedExtensions: string[] = [],
+        requestSplitter?: Splitter
     ): Promise<{ added: number, removed: number, modified: number }> {
         const collectionName = this.getCollectionName(codebasePath);
         const synchronizer = this.synchronizers.get(collectionName);
+        const splitter = requestSplitter || this.codeSplitter;
 
         if (!synchronizer) {
-            // Load project-specific ignore patterns before creating FileSynchronizer
-            await this.loadIgnorePatterns(codebasePath);
+            // Recreate the synchronizer with the same request-scoped options that
+            // were used for the original indexing task.
+            const ignorePatterns = await this.loadIgnorePatterns(codebasePath, additionalIgnorePatterns);
+            const supportedExtensions = this.getEffectiveSupportedExtensions(additionalSupportedExtensions);
 
             // To be safe, let's initialize if it's not there.
-            const newSynchronizer = new FileSynchronizer(codebasePath, this.ignorePatterns, this.supportedExtensions);
+            const newSynchronizer = new FileSynchronizer(codebasePath, ignorePatterns, supportedExtensions);
             await newSynchronizer.initialize();
             this.synchronizers.set(collectionName, newSynchronizer);
         }
@@ -371,7 +460,8 @@ export class Context {
                 codebasePath,
                 (filePath, fileIndex, totalFiles) => {
                     updateProgress(`Indexed ${filePath} (${fileIndex}/${totalFiles})`);
-                }
+                },
+                splitter
             );
         }
 
@@ -482,12 +572,13 @@ export class Context {
                 score: result.score
             }));
 
-            console.log(`[Context] ✅ Found ${results.length} relevant hybrid results`);
-            if (results.length > 0) {
-                console.log(`[Context] 🔍 Top result score: ${results[0].score}, path: ${results[0].relativePath}`);
+            const dedupedResults = this.deduplicateResults(results);
+            console.log(`[Context] ✅ Found ${results.length} results, ${dedupedResults.length} after dedup`);
+            if (dedupedResults.length > 0) {
+                console.log(`[Context] 🔍 Top result score: ${dedupedResults[0].score}, path: ${dedupedResults[0].relativePath}`);
             }
 
-            return results;
+            return dedupedResults;
         } else {
             // Regular semantic search
             // 1. Generate query vector
@@ -510,9 +601,36 @@ export class Context {
                 score: result.score
             }));
 
-            console.log(`[Context] ✅ Found ${results.length} relevant results`);
-            return results;
+            const dedupedResults = this.deduplicateResults(results);
+            console.log(`[Context] ✅ Found ${results.length} results, ${dedupedResults.length} after dedup`);
+            return dedupedResults;
         }
+    }
+
+    /**
+     * Deduplicate search results by file + line range overlap.
+     * Keeps higher-scored result when two results from the same file overlap >50%.
+     */
+    private deduplicateResults(results: SemanticSearchResult[]): SemanticSearchResult[] {
+        const kept: SemanticSearchResult[] = [];
+
+        for (const result of results) {
+            const overlaps = kept.some((existing) => {
+                if (existing.relativePath !== result.relativePath) return false;
+                const overlapStart = Math.max(existing.startLine, result.startLine);
+                const overlapEnd = Math.min(existing.endLine, result.endLine);
+                if (overlapStart > overlapEnd) return false;
+                // Line ranges are inclusive (endLine = startLine + N - 1).
+                const overlapSize = overlapEnd - overlapStart + 1;
+                const resultSize = result.endLine - result.startLine + 1;
+                return resultSize > 0 && overlapSize / resultSize > 0.5;
+            });
+            if (!overlaps) {
+                kept.push(result);
+            }
+        }
+
+        return kept;
     }
 
     /**
@@ -561,10 +679,8 @@ export class Context {
     updateIgnorePatterns(ignorePatterns: string[]): void {
         // Merge with default patterns and any existing custom patterns, avoiding duplicates
         const mergedPatterns = [...DEFAULT_IGNORE_PATTERNS, ...ignorePatterns];
-        const uniquePatterns: string[] = [];
-        const patternSet = new Set(mergedPatterns);
-        patternSet.forEach(pattern => uniquePatterns.push(pattern));
-        this.ignorePatterns = uniquePatterns;
+        this.baseIgnorePatterns = this.dedupePatterns(mergedPatterns);
+        this.ignorePatterns = [...this.baseIgnorePatterns];
         console.log(`[Context] 🚫 Updated ignore patterns: ${ignorePatterns.length} new + ${DEFAULT_IGNORE_PATTERNS.length} default = ${this.ignorePatterns.length} total patterns`);
     }
 
@@ -575,12 +691,10 @@ export class Context {
     addCustomIgnorePatterns(customPatterns: string[]): void {
         if (customPatterns.length === 0) return;
 
-        // Merge current patterns with new custom patterns, avoiding duplicates
-        const mergedPatterns = [...this.ignorePatterns, ...customPatterns];
-        const uniquePatterns: string[] = [];
-        const patternSet = new Set(mergedPatterns);
-        patternSet.forEach(pattern => uniquePatterns.push(pattern));
-        this.ignorePatterns = uniquePatterns;
+        // Merge persistent base patterns with new custom patterns, avoiding duplicates.
+        const mergedPatterns = [...this.baseIgnorePatterns, ...customPatterns];
+        this.baseIgnorePatterns = this.dedupePatterns(mergedPatterns);
+        this.ignorePatterns = [...this.baseIgnorePatterns];
         console.log(`[Context] 🚫 Added ${customPatterns.length} custom ignore patterns. Total: ${this.ignorePatterns.length} patterns`);
     }
 
@@ -588,7 +702,8 @@ export class Context {
      * Reset ignore patterns to defaults only
      */
     resetIgnorePatternsToDefaults(): void {
-        this.ignorePatterns = [...DEFAULT_IGNORE_PATTERNS];
+        this.baseIgnorePatterns = [...DEFAULT_IGNORE_PATTERNS];
+        this.ignorePatterns = [...this.baseIgnorePatterns];
         console.log(`[Context] 🔄 Reset ignore patterns to defaults: ${this.ignorePatterns.length} patterns`);
     }
 
@@ -659,7 +774,11 @@ export class Context {
     /**
      * Recursively get all code files in the codebase
      */
-    private async getCodeFiles(codebasePath: string): Promise<string[]> {
+    private async getCodeFiles(
+        codebasePath: string,
+        ignorePatterns: string[] = this.ignorePatterns,
+        supportedExtensions: string[] = this.supportedExtensions
+    ): Promise<string[]> {
         const files: string[] = [];
 
         const traverseDirectory = async (currentPath: string) => {
@@ -669,7 +788,7 @@ export class Context {
                 const fullPath = path.join(currentPath, entry.name);
 
                 // Check if path matches ignore patterns
-                if (this.matchesIgnorePattern(fullPath, codebasePath)) {
+                if (this.matchesIgnorePattern(fullPath, codebasePath, ignorePatterns)) {
                     continue;
                 }
 
@@ -677,7 +796,7 @@ export class Context {
                     await traverseDirectory(fullPath);
                 } else if (entry.isFile()) {
                     const ext = path.extname(entry.name);
-                    if (this.supportedExtensions.includes(ext)) {
+                    if (supportedExtensions.includes(ext)) {
                         files.push(fullPath);
                     }
                 }
@@ -698,7 +817,8 @@ export class Context {
     private async processFileList(
         filePaths: string[],
         codebasePath: string,
-        onFileProcessed?: (filePath: string, fileIndex: number, totalFiles: number) => void
+        onFileProcessed?: (filePath: string, fileIndex: number, totalFiles: number) => void,
+        splitter: Splitter = this.codeSplitter
     ): Promise<{ processedFiles: number; totalChunks: number; status: 'completed' | 'limit_reached' }> {
         const isHybrid = this.getIsHybrid();
         const EMBEDDING_BATCH_SIZE = Math.max(1, parseInt(envManager.get('EMBEDDING_BATCH_SIZE') || '100', 10));
@@ -716,7 +836,7 @@ export class Context {
             try {
                 const content = await fs.promises.readFile(filePath, 'utf-8');
                 const language = this.getLanguageFromExtension(path.extname(filePath));
-                const chunks = await this.codeSplitter.split(content, language, filePath);
+                const chunks = await splitter.split(content, language, filePath);
 
                 // Log files with many chunks or large content
                 if (chunks.length > 50) {
@@ -903,6 +1023,8 @@ export class Context {
             '.scala': 'scala',
             '.m': 'objective-c',
             '.mm': 'objective-c',
+            '.dart': 'dart',
+            '.sol': 'solidity',
             '.ipynb': 'jupyter'
         };
         return languageMap[ext] || 'text';
@@ -941,11 +1063,13 @@ export class Context {
     }
 
     /**
-     * Load ignore patterns from various ignore files in the codebase
-     * This method preserves any existing custom patterns that were added before
+     * Load ignore patterns from various ignore files in the codebase.
+     * Returns the effective patterns for the current codebase/request without
+     * allowing file-based patterns from previous codebases to leak forward.
      * @param codebasePath Path to the codebase
+     * @param additionalIgnorePatterns Ignore patterns for the current request
      */
-    private async loadIgnorePatterns(codebasePath: string): Promise<void> {
+    private async loadIgnorePatterns(codebasePath: string, additionalIgnorePatterns: string[] = []): Promise<string[]> {
         try {
             let fileBasedPatterns: string[] = [];
 
@@ -960,16 +1084,32 @@ export class Context {
             const globalIgnorePatterns = await this.loadGlobalIgnoreFile();
             fileBasedPatterns.push(...globalIgnorePatterns);
 
-            // Merge file-based patterns with existing patterns (which may include custom MCP patterns)
-            if (fileBasedPatterns.length > 0) {
-                this.addCustomIgnorePatterns(fileBasedPatterns);
-                console.log(`[Context] 🚫 Loaded total ${fileBasedPatterns.length} ignore patterns from all ignore files`);
+            const effectiveIgnorePatterns = this.dedupePatterns([
+                ...this.baseIgnorePatterns,
+                ...additionalIgnorePatterns,
+                ...fileBasedPatterns
+            ]);
+            // Preserve the previous observable getIgnorePatterns() behavior for
+            // sequential callers, while all indexing paths use the local return
+            // value to avoid shared-state leakage between background tasks.
+            this.ignorePatterns = effectiveIgnorePatterns;
+
+            if (fileBasedPatterns.length > 0 || additionalIgnorePatterns.length > 0) {
+                console.log(`[Context] 🚫 Loaded total ${fileBasedPatterns.length} ignore patterns from all ignore files and ${additionalIgnorePatterns.length} request ignore patterns`);
             } else {
-                console.log('📄 No ignore files found, keeping existing patterns');
+                console.log('📄 No ignore files found, using base ignore patterns');
             }
+            return effectiveIgnorePatterns;
         } catch (error) {
             console.warn(`[Context] ⚠️ Failed to load ignore patterns: ${error}`);
-            // Continue with existing patterns on error - don't reset them
+            // Continue with base/request patterns on error - don't reuse
+            // previously loaded codebase-specific patterns.
+            const fallbackPatterns = this.dedupePatterns([
+                ...this.baseIgnorePatterns,
+                ...additionalIgnorePatterns
+            ]);
+            this.ignorePatterns = fallbackPatterns;
+            return fallbackPatterns;
         }
     }
 
@@ -1051,15 +1191,24 @@ export class Context {
      * @param basePath Base path for relative pattern matching
      * @returns True if path should be ignored
      */
-    private matchesIgnorePattern(filePath: string, basePath: string): boolean {
-        if (this.ignorePatterns.length === 0) {
+    private matchesIgnorePattern(filePath: string, basePath: string, ignorePatterns: string[] = this.ignorePatterns): boolean {
+        const relativePath = path.relative(basePath, filePath);
+
+        // Always ignore dotfiles/dotdirs to stay aligned with
+        // FileSynchronizer.shouldIgnore. If these traversals diverge, files
+        // indexed here are never hashed by the synchronizer and their stale
+        // chunks linger in Milvus forever.
+        if (relativePath.split(path.sep).some(part => part.startsWith('.'))) {
+            return true;
+        }
+
+        if (ignorePatterns.length === 0) {
             return false;
         }
 
-        const relativePath = path.relative(basePath, filePath);
         const normalizedPath = relativePath.replace(/\\/g, '/'); // Normalize path separators
 
-        for (const pattern of this.ignorePatterns) {
+        for (const pattern of ignorePatterns) {
             if (this.isPatternMatch(normalizedPath, pattern)) {
                 return true;
             }
@@ -1075,22 +1224,53 @@ export class Context {
      * @returns True if pattern matches
      */
     private isPatternMatch(filePath: string, pattern: string): boolean {
+        const cleanPath = filePath.replace(/\\/g, '/').replace(/^\/+|\/+$/g, '');
+        const normalizedPattern = pattern.replace(/\\/g, '/');
+        const cleanPattern = normalizedPattern.replace(/^\/+|\/+$/g, '');
+        const isRootAnchored = normalizedPattern.startsWith('/');
+        const isDirectoryPattern = normalizedPattern.endsWith('/');
+
+        if (!cleanPath || !cleanPattern) {
+            return false;
+        }
+
         // Handle directory patterns (ending with /)
-        if (pattern.endsWith('/')) {
-            const dirPattern = pattern.slice(0, -1);
-            const pathParts = filePath.split('/');
-            return pathParts.some(part => this.simpleGlobMatch(part, dirPattern));
+        if (isDirectoryPattern) {
+            if (isRootAnchored) {
+                return this.simpleGlobMatch(cleanPath, cleanPattern) ||
+                    cleanPath.startsWith(`${cleanPattern}/`);
+            }
+
+            return this.matchesDirectoryPattern(cleanPath, cleanPattern);
+        }
+
+        if (isRootAnchored) {
+            return this.simpleGlobMatch(cleanPath, cleanPattern);
         }
 
         // Handle file patterns
-        if (pattern.includes('/')) {
+        if (cleanPattern.includes('/')) {
             // Pattern with path separator - match exact path
-            return this.simpleGlobMatch(filePath, pattern);
+            return this.simpleGlobMatch(cleanPath, cleanPattern);
         } else {
             // Pattern without path separator - match filename in any directory
-            const fileName = path.basename(filePath);
-            return this.simpleGlobMatch(fileName, pattern);
+            const fileName = path.basename(cleanPath);
+            return this.simpleGlobMatch(fileName, cleanPattern);
         }
+    }
+
+    private matchesDirectoryPattern(filePath: string, dirPattern: string): boolean {
+        const pathParts = filePath.split('/');
+        const dirPartCount = dirPattern.split('/').length;
+
+        for (let i = 0; i <= pathParts.length - dirPartCount; i++) {
+            const candidate = pathParts.slice(i, i + dirPartCount).join('/');
+            if (this.simpleGlobMatch(candidate, dirPattern)) {
+                return true;
+            }
+        }
+
+        return false;
     }
 
     /**
@@ -1107,6 +1287,10 @@ export class Context {
 
         const regex = new RegExp(`^${regexPattern}$`);
         return regex.test(text);
+    }
+
+    private dedupePatterns(patterns: string[]): string[] {
+        return [...new Set(patterns)];
     }
 
     /**
@@ -1158,6 +1342,13 @@ export class Context {
         }
     }
 
+    private normalizeExtensions(extensions: string[]): string[] {
+        return extensions
+            .map(ext => ext.trim())
+            .filter(ext => ext.length > 0)
+            .map(ext => ext.startsWith('.') ? ext : `.${ext}`);
+    }
+
     /**
      * Add custom extensions (from MCP or other sources) without replacing existing ones
      * @param customExtensions Array of custom extensions to add
@@ -1165,10 +1356,7 @@ export class Context {
     addCustomExtensions(customExtensions: string[]): void {
         if (customExtensions.length === 0) return;
 
-        // Ensure extensions start with dot
-        const normalizedExtensions = customExtensions.map(ext =>
-            ext.startsWith('.') ? ext : `.${ext}`
-        );
+        const normalizedExtensions = this.normalizeExtensions(customExtensions);
 
         // Merge current extensions with new custom extensions, avoiding duplicates
         const mergedExtensions = [...this.supportedExtensions, ...normalizedExtensions];

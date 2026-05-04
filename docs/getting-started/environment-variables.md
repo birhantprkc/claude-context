@@ -47,6 +47,7 @@ Claude Context supports a global configuration file at `~/.context/.env` to simp
 |----------|-------------|---------|
 | `MILVUS_TOKEN` | Milvus authentication token. Get [Zilliz Personal API Key](https://github.com/zilliztech/claude-context/blob/master/assets/signup_and_get_apikey.png) | Recommended |
 | `MILVUS_ADDRESS` | Milvus server address. Optional when using Zilliz Personal API Key | Auto-resolved from token |
+| `MILVUS_COLLECTION_LIMIT_CHECK_TIMEOUT_MS` | Timeout for gRPC pre-check in `checkCollectionLimit()` before indexing begins | `15000` |
 
 ### Ollama (Optional)
 | Variable | Description | Default |
@@ -63,6 +64,9 @@ Claude Context supports a global configuration file at `~/.context/.env` to simp
 | `SPLITTER_TYPE` | Code splitter type: `ast`, `langchain` | `ast` |
 | `CUSTOM_EXTENSIONS` | Additional file extensions to include (comma-separated, e.g., `.vue,.svelte,.astro`) | None |
 | `CUSTOM_IGNORE_PATTERNS` | Additional ignore patterns (comma-separated, e.g., `temp/**,*.backup,private/**`) | None |
+| `CODE_CHUNKS_COLLECTION_NAME_OVERRIDE` | Optional custom prefix for collection names. Produces `code_chunks_<suffix>_<pathHash>` or `hybrid_code_chunks_<suffix>_<pathHash>` after sanitization. The path hash stays appended so collections remain unique per codebase even when the override is set | None |
+
+When `CODE_CHUNKS_COLLECTION_NAME_OVERRIDE` is set, Claude Context writes to an override-named collection instead of the default `code_chunks_<pathHash>`. The per-codebase `<pathHash>` suffix is preserved to keep multiple codebases distinct under the same override. If you later unset the variable, Claude Context returns to the plain hash-based naming for that path.
 
 ## 🚀 Quick Setup
 
@@ -73,6 +77,7 @@ cat > ~/.context/.env << 'EOF'
 EMBEDDING_PROVIDER=OpenAI
 OPENAI_API_KEY=sk-your-openai-api-key
 EMBEDDING_MODEL=text-embedding-3-small
+MILVUS_ADDRESS=your-zilliz-cloud-public-endpoint
 MILVUS_TOKEN=your-zilliz-cloud-api-key
 EOF
 ```
@@ -83,7 +88,11 @@ See the [Example File](../../.env.example) for more details.
 
 **Claude Code:**
 ```bash
-claude mcp add claude-context -- npx @zilliz/claude-context-mcp@latest
+claude mcp add claude-context \
+  -e OPENAI_API_KEY=sk-your-openai-api-key \
+  -e MILVUS_ADDRESS=your-zilliz-cloud-public-endpoint \
+  -e MILVUS_TOKEN=your-zilliz-cloud-api-key \
+  -- npx @zilliz/claude-context-mcp@latest
 ```
 
 **Cursor/Windsurf/Others:**

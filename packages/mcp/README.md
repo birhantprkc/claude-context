@@ -130,6 +130,9 @@ EMBEDDING_MODEL=nomic-embed-text
 
 # Optional: Specify Ollama host (default: http://127.0.0.1:11434)
 OLLAMA_HOST=http://127.0.0.1:11434
+
+# Optional: Override embedding dimension to skip runtime dimension detection
+EMBEDDING_DIMENSION=768
 ```
 
 **Setup Instructions:**
@@ -159,6 +162,9 @@ Copy your Personal Key to replace `your-zilliz-cloud-api-key` in the configurati
 
 ```bash
 MILVUS_TOKEN=your-zilliz-cloud-api-key
+
+# Optional: increase timeout for Milvus collection-limit pre-check on slow clusters (default: 15000)
+MILVUS_COLLECTION_LIMIT_CHECK_TIMEOUT_MS=30000
 ```
 
 #### Embedding Batch Size
@@ -183,6 +189,44 @@ CUSTOM_IGNORE_PATTERNS=temp/**,*.backup,private/**,uploads/**
 
 These settings work in combination with tool parameters - patterns from both sources will be merged together.
 
+#### Custom Collection Name (Optional)
+
+Use this when you want a human-readable prefix on collection names in Milvus/Zilliz instead of the bare hash:
+
+```bash
+# Creates code_chunks_my_project_<pathHash> or hybrid_code_chunks_my_project_<pathHash>
+CODE_CHUNKS_COLLECTION_NAME_OVERRIDE=my_project
+```
+
+The per-codebase `<pathHash>` suffix is preserved even when the override is set, so the same MCP server can still index multiple repos without collapsing them onto one collection. The override value is sanitized to letters, numbers, and underscores, and truncated to keep the full name within Milvus's 255-char limit. If you unset the variable later, Claude Context switches back to the plain `code_chunks_<pathHash>` naming.
+
+#### Trigger File Watcher (Optional)
+
+In addition to the periodic background sync, the MCP server watches a sentinel file at `~/.context/.sync-trigger` and starts an immediate re-index whenever the file is modified. This lets external tools (Claude Code `PostToolUse` hooks, editor save hooks, CI scripts, etc.) request a sync on demand instead of waiting for the next polling tick.
+
+```bash
+# Default: watcher enabled. Set to false to disable filesystem watching entirely
+# (useful on read-only filesystems or sandboxed environments).
+CLAUDE_CONTEXT_TRIGGER_WATCHER=true
+```
+
+Example — Claude Code hook that re-indexes after every Edit/Write:
+
+```json
+"hooks": {
+  "PostToolUse": [
+    { "matcher": "Edit|Write", "hooks": [
+      { "type": "command", "command": "touch ~/.context/.sync-trigger" }
+    ]}
+  ]
+}
+```
+
+Notes:
+- The trigger fires a debounced re-index (2 s window) so rapid touches collapse to a single sync.
+- Triggered syncs go through the same global cross-process lock as background sync, so when multiple MCP processes share `$HOME` only one process performs the work per trigger.
+- The trigger file's *contents* are ignored — only the modification event matters.
+
 ## Usage with MCP Clients
 
 <details>
@@ -192,7 +236,7 @@ Use the command line interface to add the Claude Context MCP server:
 
 ```bash
 # Add the Claude Context MCP server
-claude mcp add claude-context -e OPENAI_API_KEY=your-openai-api-key -e MILVUS_TOKEN=your-zilliz-cloud-api-key -- npx @zilliz/claude-context-mcp@latest
+claude mcp add claude-context -e OPENAI_API_KEY=your-openai-api-key -e MILVUS_ADDRESS=your-zilliz-cloud-public-endpoint -e MILVUS_TOKEN=your-zilliz-cloud-api-key -- npx @zilliz/claude-context-mcp@latest
 
 ```
 
@@ -347,6 +391,7 @@ Pasting the following configuration into your Cursor `~/.cursor/mcp.json` file i
         "EMBEDDING_PROVIDER": "Ollama",
         "EMBEDDING_MODEL": "nomic-embed-text",
         "OLLAMA_HOST": "http://127.0.0.1:11434",
+        "EMBEDDING_DIMENSION": "768",
         "MILVUS_TOKEN": "your-zilliz-cloud-api-key"
       }
     }
@@ -457,7 +502,7 @@ Cherry Studio allows for visual MCP server configuration through its settings in
    - **Name**: `claude-context`
    - **Type**: `STDIO`
    - **Command**: `npx`
-   - **Arguments**: `["@zilliz/claude-context-mcp@latest"]`
+   - **Arguments**: `["-y", "@zilliz/claude-context-mcp@latest"]`
    - **Environment Variables**:
      - `OPENAI_API_KEY`: `your-openai-api-key`
      - `MILVUS_TOKEN`: `your-zilliz-cloud-api-key`
@@ -667,6 +712,16 @@ Get the current indexing status of a codebase. Shows progress percentage for act
 **Parameters:**
 
 - `path` (required): Absolute path to the codebase directory to check status for
+
+**What the status output means:**
+
+- Progress is **phase-based**, not a direct file-count ratio. The MCP server reports coarse milestones for collection preparation, file scanning, and file processing / embedding work.
+- Because indexing runs in the background and progress is persisted periodically, percentages can jump quickly on large repositories or appear unchanged for a while during long embedding batches.
+- File and chunk statistics are written when an indexing run finishes successfully. During active indexing, `get_indexing_status` intentionally reports progress rather than live file/chunk totals.
+- Codebases are keyed by their **absolute path**. Indexing `/repo`, a symlinked path to the same repo, and a second clone will create separate tracked entries.
+- If a completed entry shows `0 files, 0 chunks`, that usually means the local snapshot metadata is stale rather than the vector database being queried live. Re-indexing, or clearing and re-indexing that exact absolute path, refreshes the stored stats.
+
+For a deeper explanation, see the [asynchronous indexing workflow guide](../../docs/dive-deep/asynchronous-indexing-workflow.md) and the [troubleshooting FAQ](../../docs/troubleshooting/faq.md).
 
 ## Contributing
 
